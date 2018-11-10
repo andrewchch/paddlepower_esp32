@@ -3,23 +3,35 @@
  */
 
 #include <float.h>
+#include <math.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+
+// Local includes
+#include "data.h"
 
 TaskHandle_t Task1, Task2;
 SemaphoreHandle_t semaphore;
 
 double reading = 0;
 double VCC = 3.14;
-#define BLE_DATA_LENGTH 2
+
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 uint8_t ble_data[BLE_DATA_LENGTH];
+uint8_t readings[MAX_READINGS * BLE_DATA_LENGTH];
+int num_readings = 0;
+uint8_t readings_buffer[MAX_READINGS * BLE_DATA_LENGTH];
+int num_buffer_readings = 0;
+int num_return_readings = 0;
+int READING_INTERVAL_MS = 20; // Interval between readings
+float READING_THRESHOLD_KGS = 0.1;
+float NUM_RETURN_READINGS = 3; // the number of readings below threshold before we trigger a return and start sending BLE stroke data
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
@@ -65,7 +77,8 @@ void setup() {
   semaphore = xSemaphoreCreateMutex();
 
 // A viewer suggested to use :     &codeForTask1, because his ESP crashed
-                    
+
+  // Gathering data on core 1
   xTaskCreatePinnedToCore(
     &gatherData,       /* Function to implement the task */
     "dataGathering",  /* Name of the task */
@@ -106,12 +119,13 @@ void setup() {
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_NOTIFY ||
+                      BLECharacteristic::PROPERTY_INDICATE ||
                       BLECharacteristic::PROPERTY_WRITE ||
                       BLECharacteristic::PROPERTY_READ
                     );
 
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
-  // Create a BLE Descriptor
+  // Create a BLE Descriptor for clients to notify us that someone is listening
   BLE2902 *ble2902 = new BLE2902();
   ble2902->setNotifications(true);
   pCharacteristic->addDescriptor(ble2902);
@@ -152,7 +166,7 @@ void doubleToIntArray(double val) {
 }
 
 /* 
- * We're going to try to trigger sends at 50Hz, which may not be respected by iOS but shouldbe by android devices.  
+ * We're going to store all readings until the force drops below a given threshhold, and then send all readings at once.  
  */
 void gatherData( void * parameter )
 {
@@ -161,42 +175,38 @@ void gatherData( void * parameter )
     double voltage = readVoltage(36);
     double ohms = voltageToOhms(voltage);
     reading = ohmsToKgs(ohms);
-    doubleToIntArray(reading);
-    xSemaphoreGive( semaphore );
-    /*
-    Serial.print(ble_data[0]);
-    Serial.print(" ");
-    Serial.println(ble_data[1]);
-    */
-    delay(20);
-  }
-}
 
-void sendDataViaBLE( void * parameter )
-{
-  for (;;) {
-    // notify changed value
-    if (deviceConnected) {
-        // Wait here for the semaphore to indicate that the reading is available, get the value and send it, then hand back the semaphore
+    // Append to the readings array
+    if (reading > READING_THRESHOLD_KGS) {
+      doubleToIntArray(reading); // populates ble_data
+      for (int i=0; i<BLE_DATA_LENGTH; i++) {
+        readings[num_readings * BLE_DATA_LENGTH + i] = ble_data[i];
+      }
+      num_readings += 1;
+      num_return_readings = 0;
+    }
+    else {
+      num_return_readings += 1;
+      if (num_return_readings >= NUM_RETURN_READINGS) {
         xSemaphoreTake( semaphore, portMAX_DELAY );
-        pCharacteristic->setValue(ble_data, BLE_DATA_LENGTH);
-        pCharacteristic->notify();
+
+        // Transfer all available readings to a buffer so we can start sending them and continue to accumulate
+        // readings for the next batch
+        int index = 0;
+        for (int r=0; r<num_readings; r++) {
+          for (int i=0; i<BLE_DATA_LENGTH; i++) {
+            index = r * BLE_DATA_LENGTH + i;
+            readings_buffer[index] = ble_data[index];
+          }          
+        }
+        num_buffer_readings = num_readings;
+        num_readings = 0;
+
+        // Give the semaphore back so the sending can start
         xSemaphoreGive( semaphore );
-        
-        delay(10); // bluetooth stack will go into congestion, if too many packets are sent
+      }
     }
-    // disconnecting
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500); // give the bluetooth stack the chance to get things ready
-        pServer->startAdvertising(); // restart advertising
-        Serial.println("start advertising");
-        oldDeviceConnected = deviceConnected;
-    }
-    // connecting
-    if (deviceConnected && !oldDeviceConnected) {
-        // do stuff here on connecting
-        oldDeviceConnected = deviceConnected;
-    }
+    delay(READING_INTERVAL_MS);        
   }
 }
 
@@ -205,11 +215,8 @@ void loop() {
     if (deviceConnected) {
         // Wait here for the semaphore to indicate that the reading is available, get the value and send it, then hand back the semaphore
         xSemaphoreTake( semaphore, portMAX_DELAY );
-        pCharacteristic->setValue(ble_data, BLE_DATA_LENGTH);
-        pCharacteristic->notify();
-        xSemaphoreGive( semaphore );
-        
-        delay(20); // bluetooth stack will go into congestion, if too many packets are sent
+        sendData(readings_buffer, num_readings * BLE_DATA_LENGTH, pCharacteristic);
+        xSemaphoreGive( semaphore );        
     }
     // disconnecting
     if (!deviceConnected && oldDeviceConnected) {
